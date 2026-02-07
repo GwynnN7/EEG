@@ -1,333 +1,326 @@
-import sys, threading, socket, struct, serial
-from datetime import datetime
-from scipy.signal import butter, filtfilt, decimate
+import sys
+import serial
+import struct
+import threading
 import numpy as np
 import pyqtgraph as pg
-import pywt
+from scipy.signal import butter, sosfilt, iirnotch, hilbert, lfilter, savgol_filter
+from PyQt5.QtCore import QTimer, Qt
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, 
+                             QWidget, QCheckBox, QGroupBox, QDoubleSpinBox, 
+                             QSpinBox, QPushButton, QLabel, QLineEdit, QMessageBox, QProgressBar)
 
-from PyQt5.QtCore import Qt, pyqtSignal, QTimer
-from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QMenuBar, QMenu, QAction, QWidget,
-    QVBoxLayout, QLabel, QSlider, QDialog, QHBoxLayout, QSpinBox, QSizePolicy
+DEFAULT_BAUD = 250000
+SAMPLE_RATE = 300
+MAX_BUFFER_SEC = 20
+FILTER_PADDING = 100 
+COLORS = ['y', 'c', 'm', 'g', 'r', 'b', 'w']
 
-)
-
-class EEGReader():
+class EEGReceiver:
     def __init__(self):
-        self.buffer = []
-        self.sps = 2000
+        self.running = False
+        self.ser = None
+        self.num_channels = 2
+        self.buffers = [] 
+        self.lock = threading.Lock()
 
-        self.HOST = '0.0.0.0'
-        self.PORT = 1234
-        #self.COM = '/dev/ttyUSB0'
-        #self.BAUD = 250000
+    def connect(self, port, baud, channels):
+        self.running = False
+        if self.ser and self.ser.is_open: self.ser.close()
+        try:
+            self.ser = serial.Serial(port, baud, timeout=1)
+            self.num_channels = channels
+            self.buffers = [[] for _ in range(channels)]
+            self.running = True
+            t = threading.Thread(target=self._read_loop, daemon=True)
+            t.start()
+            return True
+        except Exception as e:
+            print(f"Connection Error: {e}")
+            return False
 
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind((self.HOST, self.PORT))
-        self.sock.listen(1)
+    def disconnect(self):
+        self.running = False
+        if self.ser: self.ser.close()
 
-    def start(self):
-        self.conn, self.addr = self.sock.accept()
-        #self.serial = serial.Serial(self.COM, self.BAUD, timeout=1)
+    def _read_loop(self):
+        packet_size = 4 * self.num_channels
+        unpack_fmt = f'{self.num_channels}f'
+        
+        while self.running:
+            try:
+                if self.ser.read(1) != b'\xAA': continue
+                data = self.ser.read(packet_size)
+                if len(data) < packet_size: continue
+                values = struct.unpack(unpack_fmt, data)
+                
+                with self.lock:
+                    for i in range(self.num_channels):
+                        self.buffers[i].append(values[i])
+                        if len(self.buffers[i]) > SAMPLE_RATE * MAX_BUFFER_SEC:
+                            self.buffers[i] = self.buffers[i][-int(SAMPLE_RATE * MAX_BUFFER_SEC):]
+            except:
+                break
 
-        t = threading.Thread(target=self.read_data)
-        t.daemon = True
-        t.start()
-
-    def read_data(self):
-        now = datetime.now()
-        while True:
-            data = self.conn.recv(4)
-            #data = self.serial.read(4)
-            if not data:
-                continue
-
-            value = struct.unpack('f', data)[0]
-            self.buffer.append(value)
-
-            if len(self.buffer) % 4096 == 0:
-                end = datetime.now()
-                sec = (end - now).total_seconds()
-                self.sps = int(4096 / sec)
-                now = end
-
-class SliderDialog(QDialog):
-    slider_change = pyqtSignal(int)
-
-    def __init__(self, parent = None):
-        super().__init__(parent)
-        self.setWindowTitle("Value Selector")
-        self.resize(200, 50)
-        self.layout = QVBoxLayout()
-
-    def setValues(self, value, max, min):
-        self.label = QLabel(f"Current value: {value}")
-        self.slider = QSpinBox()
-        self.slider.setMinimum(min)
-        self.slider.setMaximum(max)
-        self.slider.setValue(value)
-        self.slider.valueChanged.connect(self.update_value)
-
-        self.layout.addWidget(self.label)
-        self.layout.addWidget(self.slider)
-        self.setLayout(self.layout)
-
-    def update_value(self, value):
-        self.label.setText(f"Slider value: {value}")
-        self.slider_change.emit(value)
-
-
-class EEGViewer(QMainWindow):
-    def __init__(self, reader):
-        self.reader = reader
-        self.values = {"buffer-size": 4096, "buffer-offset": 2048, 'filter': 4, 'smooth': 64}
-        self.maxs = {"buffer-size": 10240, "buffer-offset": 8192, 'filter': 12, 'smooth': 256}
-        self.mins = {"buffer-size": 16, "buffer-offset": 0, 'filter': 1, 'smooth': 2}
-        self.filters = {"low-pass": True, "high-pass": True, "smooth": False, "powerline": False, "split": False}
-        self.activateFilters = True
-
+class EEGDashboard(QMainWindow):
+    def __init__(self, receiver):
         super().__init__()
+        self.receiver = receiver
+        self.paused = False
+        
+        self.is_calibrating = False
+        self.calibration_data = []
+        self.baseline_mean = [0.0] * 8
+        self.baseline_std = [1.0] * 8
+        self.artifact_thresh_sigma = 4.0
+        self.is_calibrated = False
 
-        self.setWindowTitle("EEG")
-        self.setFixedSize(1800, 900)
-
+        self.setWindowTitle("EEG Dashboard")
+        self.resize(1400, 900)
+        
         central = QWidget()
-        self.main_layout = QHBoxLayout(central)
         self.setCentralWidget(central)
+        self.main_layout = QHBoxLayout(central)
 
-        self.left_layout = QVBoxLayout()
-        self.right_layout = QVBoxLayout()
-        self.main_layout.addLayout(self.left_layout)
-        self.main_layout.addLayout(self.right_layout)
+        self.init_sidebar()
+        self.plot_layout = QVBoxLayout()
+        self.init_plots()
+        
+        self.main_layout.addLayout(self.sidebar_layout, 1)
+        self.main_layout.addLayout(self.plot_layout, 4)
 
-        self.eeg = pg.PlotWidget(title="Raw EEG")
-        self.eeg.showGrid(x=True, y=True)
-        self.eegGraph = self.eeg.plot(pen='y')
-        self.left_layout.addWidget(self.eeg)
-
-        self.filteredEeg = pg.PlotWidget(title="Filtered EEG")
-        self.filteredEeg.showGrid(x=True, y=True)
-        self.filteredEegGraph = self.filteredEeg.plot(pen='y')
-        self.left_layout.addWidget(self.filteredEeg)
-
-        self.fft = pg.PlotWidget(title="FFT")
-        self.fft.showGrid(x=True, y=True)
-        self.FFTGraph = self.fft.plot(pen='c')
-        self.left_layout.addWidget(self.fft)
-
-        self.wavelets = []
-        self.waveletsGraphs = []
-
-        self.waveletsLevels = ["0Hz ~ 2Hz [Drifts/Delta]",
-                      "2Hz ~ 4Hz [Delta]",
-                      "4Hz ~ 8Hz [Theta]",
-                      "8Hz ~ 15Hz [Alpha]",
-                      "15Hz ~ 31Hz [Beta]",
-                      "31Hz ~ 60Hz [Gamma]",
-                      "60Hz ~ 125Hz [Muscle Noise]",
-                      "125Hz ~ 250Hz [Noise]",
-                      "250Hz ~ 500Hz [Noise]",
-                      "500Hz ~ 1000Hz [Noise]",
-                      ]
-
-        for i in range(len(self.waveletsLevels)):
-            self.wavelets.append(pg.PlotWidget(title=self.waveletsLevels[i]))
-            curve = self.wavelets[i].plot(pen='r')
-            self.waveletsGraphs.append(curve)
-            self.right_layout.addWidget(self.wavelets[i])
-            self.wavelets[i].setVisible(i <= 6)
-
+        self.update_filters()
+        
         self.timer = QTimer()
-        self.timer.timeout.connect(self.update_plot)
-        self.timer.start(10)
+        self.timer.timeout.connect(self.update_loop)
+        self.timer.start(40)
 
-        self.init_menu()
+    def init_sidebar(self):
+        self.sidebar_layout = QVBoxLayout()
+        
+        self.grp_conn = QGroupBox("1. Connection")
+        vbox_conn = QVBoxLayout()
+        self.txt_port = QLineEdit("/dev/ttyUSB0") 
+        self.txt_port.setPlaceholderText("Port")
+        self.spin_channels = QSpinBox(); self.spin_channels.setValue(2)
+        self.btn_connect = QPushButton("Connect")
+        self.btn_connect.setStyleSheet("background-color: #ccffcc; font-weight: bold;")
+        self.btn_connect.clicked.connect(self.handle_connect)
+        vbox_conn.addWidget(self.txt_port)
+        vbox_conn.addWidget(QLabel("Channels:"))
+        vbox_conn.addWidget(self.spin_channels)
+        vbox_conn.addWidget(self.btn_connect)
+        self.grp_conn.setLayout(vbox_conn)
+        self.sidebar_layout.addWidget(self.grp_conn)
 
-    def init_menu(self):
-        self.menubar = self.menuBar()
-        self.init_settings()
-        self.init_eeg_settings()
-        self.init_wavelets_settings()
+        self.grp_calib = QGroupBox("2. Noise Calibration")
+        vbox_calib = QVBoxLayout()
+        self.btn_calibrate = QPushButton("Calibration (5s)")
+        self.btn_calibrate.clicked.connect(self.start_calibration)
+        self.btn_calibrate.setStyleSheet("background-color: #ffeb3b; font-weight: bold;")
+        self.lbl_calib_status = QLabel("Status: Uncalibrated")
+        self.lbl_calib_status.setStyleSheet("color: red")
+        self.progress_calib = QProgressBar()
+        self.progress_calib.setRange(0, 100); self.progress_calib.setValue(0)
+        vbox_calib.addWidget(self.btn_calibrate)
+        vbox_calib.addWidget(self.progress_calib)
+        vbox_calib.addWidget(self.lbl_calib_status)
+        self.grp_calib.setLayout(vbox_calib)
+        self.sidebar_layout.addWidget(self.grp_calib)
 
-    def init_settings(self):
-        menu = self.menubar.addMenu("Settings")
+        # 3. Controls
+        self.grp_control = QGroupBox("3. Visualization")
+        vbox_c = QVBoxLayout()
+        self.btn_pause = QPushButton("Pause")
+        self.btn_pause.setCheckable(True)
+        self.btn_pause.clicked.connect(self.toggle_pause)
+        
+        self.lbl_window = QLabel("Window:")
+        self.spin_window = QDoubleSpinBox()
+        self.spin_window.setRange(1.0, 10.0); self.spin_window.setValue(3.0)
 
-        buffersize = QAction("Buffer Size", self)
-        buffersize.triggered.connect(lambda: self.open_slider_dialog('buffer-size'))
-        menu.addAction(buffersize)
+        # Envelope
+        self.lbl_savgol = QLabel("SavGol Window:")
+        self.spin_savgol_win = QSpinBox()
+        self.spin_savgol_win.setRange(3, 101); self.spin_savgol_win.setValue(31); self.spin_savgol_win.setSingleStep(2)
+        
+        self.lbl_savgol_poly = QLabel("SavGol Poly Order:")
+        self.spin_savgol_poly = QSpinBox()
+        self.spin_savgol_poly.setRange(1, 5); self.spin_savgol_poly.setValue(3)
 
-        bufferoffset = QAction("Buffer Offset", self)
-        bufferoffset.triggered.connect(lambda: self.open_slider_dialog('buffer-offset'))
-        menu.addAction(bufferoffset)
+        vbox_c.addWidget(self.btn_pause)
+        vbox_c.addWidget(self.lbl_window)
+        vbox_c.addWidget(self.spin_window)
+        vbox_c.addWidget(self.lbl_savgol)
+        vbox_c.addWidget(self.spin_savgol_win)
+        vbox_c.addWidget(self.lbl_savgol_poly)
+        vbox_c.addWidget(self.spin_savgol_poly)
+        self.grp_control.setLayout(vbox_c)
+        self.sidebar_layout.addWidget(self.grp_control)
+        
+        # 4. Filters
+        self.grp_filters = QGroupBox("4. Filters")
+        vbox_f = QVBoxLayout()
+        self.chk_notch = QCheckBox("50Hz Notch"); self.chk_notch.setChecked(True)
+        self.chk_bandpass = QCheckBox("Bandpass"); self.chk_bandpass.setChecked(True)
+        self.chk_detrend = QCheckBox("Detrend"); self.chk_detrend.setChecked(True)
+        
+        self.chk_notch.toggled.connect(self.update_filters)
+        self.chk_bandpass.toggled.connect(self.update_filters)
+        
+        self.spin_low = QDoubleSpinBox(); self.spin_low.setRange(0.1, 50.0); self.spin_low.setValue(8.0)
+        self.spin_high = QDoubleSpinBox(); self.spin_high.setRange(1.0, 100.0); self.spin_high.setValue(12.0)
+        self.spin_low.valueChanged.connect(self.update_filters)
+        self.spin_high.valueChanged.connect(self.update_filters)
 
-        filters = QAction("Activate Filters", self)
-        filters.setCheckable(True)
-        filters.setChecked(self.activateFilters)
-        filters.toggled.connect(self.toggleActivateFilters)
-        menu.addAction(filters)
+        vbox_f.addWidget(self.chk_notch)
+        vbox_f.addWidget(self.chk_bandpass)
+        vbox_f.addWidget(self.chk_detrend)
+        vbox_f.addWidget(QLabel("Freq Low/High:"))
+        vbox_f.addWidget(self.spin_low)
+        vbox_f.addWidget(self.spin_high)
+        self.grp_filters.setLayout(vbox_f)
+        self.sidebar_layout.addWidget(self.grp_filters)
 
-    def toggleActivateFilters(self, value):
-        self.activateFilters = value
+        self.sidebar_layout.addStretch()
 
-    def init_eeg_settings(self):
-        eeg_menu = self.menubar.addMenu("EEG")
+    def init_plots(self):
+        self.plot_raw = pg.PlotWidget(title="Raw")
+        self.plot_proc = pg.PlotWidget(title="Filtered")
+        self.plot_env = pg.PlotWidget(title="Envelope")
+        
+        for p in [self.plot_raw, self.plot_proc, self.plot_env]:
+            p.showGrid(x=True, y=True)
+            self.plot_layout.addWidget(p)
+            
+        self.curves_raw, self.curves_proc, self.curves_env = [], [], []
+        self.chk_channels = []
 
-        filter_order = QAction("Filter Strength", self)
-        filter_order.triggered.connect(lambda: self.open_slider_dialog('filter'))
-        eeg_menu.addAction(filter_order)
+    def handle_connect(self):
+        if self.receiver.connect(self.txt_port.text(), DEFAULT_BAUD, self.spin_channels.value()):
+            self.btn_connect.setText("Connected"); self.btn_connect.setStyleSheet("background-color: #aaffaa;")
+            self.rebuild_channels_ui(self.spin_channels.value())
 
-        smooth_order = QAction("Smooth Strength", self)
-        smooth_order.triggered.connect(lambda: self.open_slider_dialog('smooth'))
-        eeg_menu.addAction(smooth_order)
+    def rebuild_channels_ui(self, n):
+        for p in [self.plot_raw, self.plot_proc, self.plot_env]: p.clear()
+        self.curves_raw, self.curves_proc, self.curves_env = [], [], []
+        
+        for i in range(n):
+            color = COLORS[i % len(COLORS)]
+            pen = pg.mkPen(color, width=1)
+            pen_thick = pg.mkPen(color, width=2)
+            self.curves_raw.append(self.plot_raw.plot(pen=pen))
+            self.curves_proc.append(self.plot_proc.plot(pen=pen))
+            self.curves_env.append(self.plot_env.plot(pen=pen_thick))
 
-        lowpass = QAction("Low Pass 30Hz", self)
-        lowpass.setCheckable(True)
-        lowpass.setChecked(self.filters['low-pass'])
-        lowpass.toggled.connect(lambda state: self.toggle_eeg_checkbox('low-pass', state))
-        eeg_menu.addAction(lowpass)
+    def start_calibration(self):
+        self.is_calibrating = True
+        self.calibration_data = [[] for _ in range(self.receiver.num_channels)]
+        self.btn_calibrate.setText("Calibrating...")
+        self.btn_calibrate.setStyleSheet("background-color: orange")
+        QTimer.singleShot(500, self.update_calibration)
+    
+    def update_calibration(self):
+        if not self.is_calibrating: return
+        total_points = SAMPLE_RATE * 5
+        current_points = len(self.calibration_data[0]) if self.calibration_data else 0
+        progress = int((current_points / total_points) * 100) if total_points > 0 else 0
+        self.progress_calib.setValue(min(progress, 100))
+        if(progress >= 100):
+            self.finish_calibration()
+        else:
+            QTimer.singleShot(500, self.update_calibration)
 
-        highpass = QAction("High Pass 0.5Hz", self)
-        highpass.setCheckable(True)
-        highpass.setChecked(self.filters['high-pass'])
-        highpass.toggled.connect(lambda state: self.toggle_eeg_checkbox('high-pass', state))
-        eeg_menu.addAction(highpass)
+    def finish_calibration(self):
+        self.is_calibrating = False
+        
+        for i in range(len(self.calibration_data)):
+            if len(self.calibration_data[i]) > 100:
+                data = np.array(self.calibration_data[i])
+                if self.chk_detrend.isChecked(): data = data - np.mean(data)
+                
+                self.baseline_mean[i] = np.mean(data)
+                self.baseline_std[i] = np.std(data)
+            else:
+                self.baseline_std[i] = 1000.0
+        
+        self.is_calibrated = True
+        self.lbl_calib_status.setText("Status: Calibrated")
+        self.lbl_calib_status.setStyleSheet("color: green; font-weight: bold")
+        self.btn_calibrate.setText("Recalibrate")
+        self.btn_calibrate.setStyleSheet("background-color: #dddddd")
 
-        split = QAction("Split Filters", self)
-        split.setCheckable(True)
-        split.setChecked(self.filters['split'])
-        split.toggled.connect(lambda state: self.toggle_eeg_checkbox('split', state))
-        eeg_menu.addAction(split)
+    def toggle_pause(self):
+        self.paused = not self.paused
+        self.btn_pause.setText("Resume" if self.paused else "Pause")
 
-        smooth = QAction("Smooth", self)
-        smooth.setCheckable(True)
-        smooth.setChecked(self.filters['smooth'])
-        smooth.toggled.connect(lambda state: self.toggle_eeg_checkbox('smooth', state))
-        eeg_menu.addAction(smooth)
+    def update_filters(self):
+        low, high = self.spin_low.value(), self.spin_high.value()
+        if low >= high: low = high - 0.5
+        self.sos_band = butter(4, [low, high], btype='band', fs=SAMPLE_RATE, output='sos')
+        self.notch_b, self.notch_a = iirnotch(50.0, 30.0, SAMPLE_RATE)
 
-        powerline = QAction("Remove 50Hz", self)
-        powerline.setCheckable(True)
-        powerline.setChecked(self.filters['powerline'])
-        powerline.toggled.connect(lambda state: self.toggle_eeg_checkbox('powerline', state))
-        eeg_menu.addAction(powerline)
+    def process_signal(self, data, ch_idx):
+        if len(data) < 10: return data, np.zeros(len(data)), False
 
-    def init_wavelets_settings(self):
-        wavelet_menu = self.menubar.addMenu("Wavelets")
-        for i in range(len(self.waveletsLevels)):
-            wavelet = QAction(self.waveletsLevels[i], self)
-            wavelet.setCheckable(True)
-            wavelet.setChecked(i <= 6)
-            wavelet.toggled.connect(lambda state, index=i: self.toggle_wavelet_checkbox(index, state))
-            wavelet_menu.addAction(wavelet)
+        if self.chk_detrend.isChecked(): data = data - np.mean(data)
+        
+        is_artifact = False
+        if self.is_calibrated and len(data) > 0:
+            recent_segment = data[-20:] 
+            if np.std(recent_segment) > (self.baseline_std[ch_idx] * self.artifact_thresh_sigma):
+                is_artifact = True
 
-    def toggle_wavelet_checkbox(self, level, checked):
-        self.wavelets[level].setVisible(checked)
-        self.resize_wavelets()
+        if self.chk_notch.isChecked(): data = lfilter(self.notch_b, self.notch_a, data)
+        if self.chk_bandpass.isChecked(): data = sosfilt(self.sos_band, data)
+            
+        analytic = hilbert(data)
+        envelope = np.abs(analytic)
+        
+        win = self.spin_savgol_win.value()
+        if win % 2 == 0: win += 1
+        poly = self.spin_savgol_poly.value()
+        if win > poly:
+            try:
+                envelope = savgol_filter(envelope, window_length=win, polyorder=poly)
+            except: pass
+            
+        return data, envelope, is_artifact
 
-    def resize_wavelets(self):
-        visible_wv = [wv for wv in self.wavelets if wv.isVisible()]
+    def update_loop(self):
+        if self.paused or not self.receiver.running: return
 
-        if not visible_wv:
-            return
+        pts = int(self.spin_window.value() * SAMPLE_RATE)
+        total_fetch = pts + FILTER_PADDING
+        
+        with self.receiver.lock:
+            for i in range(min(len(self.curves_raw), len(self.receiver.buffers))):
+                raw = list(self.receiver.buffers[i])
+                
+                if self.is_calibrating:
+                    self.calibration_data[i].extend(raw[-10:])
+                
+                if len(raw) < total_fetch: continue
+                
+                process_arr = np.array(raw[-total_fetch:])
+                display_slice = slice(FILTER_PADDING, None)
 
-        margins = self.layout().contentsMargins()
-        spacing = self.layout().spacing()
-        usable_height = self.height() - margins.top() - margins.bottom() - (spacing * (len(visible_wv) -1))
-        height = usable_height // len(visible_wv)
+                self.curves_raw[i].setData(process_arr[display_slice])
+                
+                proc, env, is_bad = self.process_signal(process_arr, i)
+                
+                self.curves_proc[i].setData(proc[display_slice])
+                
+                if is_bad:
+                    self.curves_proc[i].setPen(pg.mkPen('r', width=2))
+                else:
+                    self.curves_proc[i].setPen(pg.mkPen(COLORS[i % len(COLORS)], width=1))
 
-        for wv in visible_wv:
-            wv.setFixedHeight(height)
-
-    def toggle_eeg_checkbox(self, type, checked):
-        self.filters[type] = checked
-
-    def open_slider_dialog(self, type):
-        dialog = SliderDialog(self)
-        dialog.setValues(self.values[type], self.maxs[type], self.mins[type])
-        dialog.slider_change.connect(lambda value: self.apply_slider_value(type, value))
-        dialog.exec_()
-
-    def apply_slider_value(self, type, value):
-        self.values[type] = value
-
-
-    def bandpass(self, data):
-        b, a = butter(self.values['filter'], [2.5, 25], btype='bandpass', analog=False, fs=self.reader.sps)
-        return filtfilt(b, a, data)
-
-    def bandstop(self, data):
-        b, a = butter(self.values['filter'], [40, 60], btype='bandstop', analog=False, fs=self.reader.sps)
-        return filtfilt(b, a, data)
-
-    def lowpass(self, data):
-        b, a = butter(self.values['filter'], 25, btype='lowpass', analog=False, fs=self.reader.sps)
-        return filtfilt(b, a, data)
-
-    def highpass(self, data):
-        b, a = butter(self.values['filter'], 2.5, btype='highpass', analog=False, fs=self.reader.sps)
-        return filtfilt(b, a, data)
-
-    def smooth(self, data):
-        data = np.array(data)
-        kernel = np.ones(self.values['smooth']) / self.values['smooth']
-        return np.convolve(data, kernel, mode='same')
-
-    def update_plot(self):
-        buffer = self.reader.buffer[-(self.values['buffer-size'] * 10):]
-
-        if(len(buffer) < self.values['buffer-size'] // 4):
-            return
-
-        raw_data = buffer[-(self.values['buffer-size'] + self.values['buffer-offset']) : -self.values['buffer-offset']]
-        self.eegGraph.setData(y=raw_data)
-
-        filtered_data = buffer[:]
-        if(self.filters['high-pass'] and self.filters['low-pass'] and not self.filters['split']):
-            filtered_data = self.bandpass(filtered_data)
-        if(self.filters['high-pass'] and self.filters['split']):
-            filtered_data = self.highpass(filtered_data)
-        if(self.filters['low-pass'] and self.filters['split']):
-            filtered_data = self.lowpass(filtered_data)
-
-        if(self.filters['powerline']):
-            filtered_data = self.bandstop(filtered_data)
-
-        filtered_data = filtered_data[-(self.values['buffer-size'] + self.values['buffer-offset']) : -self.values['buffer-offset']]
-
-        if(self.filters['smooth']):
-            filtered_data = self.smooth(filtered_data)
-
-        self.filteredEegGraph.setData(y=filtered_data)
-
-        data = filtered_data if self.activateFilters else raw_data
-
-        if len(data) >= self.values['buffer-size']:
-            fft_vals = np.fft.rfft(np.array(data) * np.hamming(self.values['buffer-size']))
-            fft_freq = np.fft.rfftfreq(self.values['buffer-size'], d=1/self.reader.sps)
-            fft_freq = fft_freq[fft_freq <= 60]
-            fft_magnitude = np.abs(fft_vals)[:len(fft_freq)]
-            self.FFTGraph.setData(fft_freq, fft_magnitude)
-
-            waveletsLevel = pywt.dwt_max_level(self.values['buffer-size'], pywt.Wavelet('db4').dec_len)
-            coeffs = pywt.wavedec(data, 'db4', level=waveletsLevel)
-            visible_wv = [wv.isVisible() for wv in self.wavelets]
-            for i in range(len(coeffs)):
-                if(visible_wv[i] == False):
-                    coeffs[i] *= 0
-
-            max_amp = max(np.max(np.abs(c)) for c in coeffs) * 1.5
-            for i, coeff in enumerate(coeffs):
-                if(visible_wv[i] == False):
-                    continue
-                #normalized_coeffs = [c / max_amp for c in coeff]
-                self.wavelets[i].setYRange(-max_amp, max_amp)
-                self.waveletsGraphs[i].setData(coeff)
+                self.curves_env[i].setData(env[display_slice])
 
 if __name__ == '__main__':
-    reader = EEGReader()
-    reader.start()
-
-    app = QApplication([])
-    viewer = EEGViewer(reader)
-    viewer.show()
-    app.exec_()
+    receiver = EEGReceiver()
+    app = QApplication(sys.argv)
+    dashboard = EEGDashboard(receiver)
+    dashboard.show()
+    sys.exit(app.exec_())
