@@ -70,7 +70,6 @@ class EEGDashboard(QMainWindow):
         
         self.is_calibrating = False
         self.calibration_data = []
-        self.baseline_mean = [0.0] * 8
         self.baseline_std = [1.0] * 8
         self.artifact_thresh_sigma = 4.0
         self.is_calibrated = False
@@ -137,12 +136,12 @@ class EEGDashboard(QMainWindow):
         
         self.lbl_window = QLabel("Window:")
         self.spin_window = QDoubleSpinBox()
-        self.spin_window.setRange(1.0, 10.0); self.spin_window.setValue(3.0)
+        self.spin_window.setRange(1.0, 15.0); self.spin_window.setValue(3.0)
 
         # Envelope
         self.lbl_savgol = QLabel("SavGol Window:")
         self.spin_savgol_win = QSpinBox()
-        self.spin_savgol_win.setRange(3, 101); self.spin_savgol_win.setValue(31); self.spin_savgol_win.setSingleStep(2)
+        self.spin_savgol_win.setRange(3, 101); self.spin_savgol_win.setValue(51); self.spin_savgol_win.setSingleStep(2)
         
         self.lbl_savgol_poly = QLabel("SavGol Poly Order:")
         self.spin_savgol_poly = QSpinBox()
@@ -164,6 +163,7 @@ class EEGDashboard(QMainWindow):
         self.chk_notch = QCheckBox("50Hz Notch"); self.chk_notch.setChecked(True)
         self.chk_bandpass = QCheckBox("Bandpass"); self.chk_bandpass.setChecked(True)
         self.chk_detrend = QCheckBox("Detrend"); self.chk_detrend.setChecked(True)
+        self.chk_clip = QCheckBox("Clip Artifacts"); self.chk_clip.setChecked(False) 
         
         self.chk_notch.toggled.connect(self.update_filters)
         self.chk_bandpass.toggled.connect(self.update_filters)
@@ -176,6 +176,7 @@ class EEGDashboard(QMainWindow):
         vbox_f.addWidget(self.chk_notch)
         vbox_f.addWidget(self.chk_bandpass)
         vbox_f.addWidget(self.chk_detrend)
+        vbox_f.addWidget(self.chk_clip)
         vbox_f.addWidget(QLabel("Freq Low/High:"))
         vbox_f.addWidget(self.spin_low)
         vbox_f.addWidget(self.spin_high)
@@ -230,7 +231,7 @@ class EEGDashboard(QMainWindow):
             self.finish_calibration()
         else:
             QTimer.singleShot(500, self.update_calibration)
-
+    
     def finish_calibration(self):
         self.is_calibrating = False
         
@@ -238,8 +239,7 @@ class EEGDashboard(QMainWindow):
             if len(self.calibration_data[i]) > 100:
                 data = np.array(self.calibration_data[i])
                 if self.chk_detrend.isChecked(): data = data - np.mean(data)
-                
-                self.baseline_mean[i] = np.mean(data)
+
                 self.baseline_std[i] = np.std(data)
             else:
                 self.baseline_std[i] = 1000.0
@@ -263,17 +263,27 @@ class EEGDashboard(QMainWindow):
     def process_signal(self, data, ch_idx):
         if len(data) < 10: return data, np.zeros(len(data)), False
 
-        if self.chk_detrend.isChecked(): data = data - np.mean(data)
-        
+        # 1. Detrend
+        if self.chk_detrend.isChecked(): 
+            data = data - np.mean(data)
+
+        # 2. Artifact Detection
         is_artifact = False
         if self.is_calibrated and len(data) > 0:
+            limit = self.baseline_std[ch_idx] * self.artifact_thresh_sigma
             recent_segment = data[-20:] 
-            if np.std(recent_segment) > (self.baseline_std[ch_idx] * self.artifact_thresh_sigma):
+            
+            if np.std(recent_segment) > limit:
                 is_artifact = True
+                
+            if self.chk_clip.isChecked():
+                data = np.clip(data, -limit, limit)
 
+        # 3. Filtering
         if self.chk_notch.isChecked(): data = lfilter(self.notch_b, self.notch_a, data)
         if self.chk_bandpass.isChecked(): data = sosfilt(self.sos_band, data)
             
+        # 4. Envelope
         analytic = hilbert(data)
         envelope = np.abs(analytic)
         
